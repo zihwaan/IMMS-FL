@@ -1,226 +1,235 @@
-# -*- coding: utf-8 -*-
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
+from typing import Tuple, List, Dict
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import Dict, List, Tuple, Any
-import warnings
-warnings.filterwarnings('ignore')
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class WADIDataset(Dataset):
-    def __init__(self, data: np.ndarray, labels: np.ndarray, window_size: int = 100):
-        self.data = data
-        self.labels = labels
-        self.window_size = window_size
+    def __init__(self, X, y, sequence_length=60):
+        self.X = X
+        self.y = y
+        self.sequence_length = sequence_length
         
     def __len__(self):
-        return len(self.data) - self.window_size + 1
+        return len(self.X) - self.sequence_length + 1
     
     def __getitem__(self, idx):
-        window_data = self.data[idx:idx + self.window_size]
-        label = self.labels[idx + self.window_size - 1]
-        return torch.FloatTensor(window_data), torch.LongTensor([label])
+        x_seq = self.X[idx:idx + self.sequence_length]
+        y_label = self.y[idx + self.sequence_length - 1]
+        return torch.FloatTensor(x_seq), torch.LongTensor([y_label])
 
-def load_wadi_dataset(csv_path: str = 'WADI_FINAL_DATASET.csv') -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    """Load and preprocess WADI dataset"""
-    df = pd.read_csv(csv_path)
-    
-    # Remove Date, Time columns and separate Label
-    feature_cols = [col for col in df.columns if col not in ['Date', 'Time', 'Label']]
-    labels = df['Label'].values
-    features = df[feature_cols].values
-    
-    # Handle NaN values
-    features = np.nan_to_num(features, nan=0.0)
-    
-    return features, labels, feature_cols
-
-def create_attack_type_mapping() -> Dict[str, List[str]]:
-    """Attack type to sensor group mapping"""
-    return {
-        'flow_pressure': [  # Edge 0: Flow/Pressure related
-            '1_FIT_001_PV', '2_FIT_001_PV', '2_FIT_002_PV', '2_FIT_003_PV', '3_FIT_001_PV',
-            '2_DPIT_001_PV', '2_PIT_001_PV', '2_PIT_002_PV', '2_PIT_003_PV',
-            '2_FIC_101_PV', '2_FIC_201_PV', '2_FIC_301_PV', '2_FIC_401_PV', '2_FIC_501_PV', '2_FIC_601_PV'
-        ],
-        'sensor_hidden': [  # Edge 1: Sensor/Hidden related
-            '1_AIT_001_PV', '1_AIT_002_PV', '1_AIT_003_PV', '1_AIT_004_PV', '1_AIT_005_PV',
-            '2A_AIT_001_PV', '2A_AIT_002_PV', '2A_AIT_003_PV', '2A_AIT_004_PV',
-            '2B_AIT_001_PV', '2B_AIT_002_PV', '2B_AIT_003_PV', '2B_AIT_004_PV',
-            '3_AIT_001_PV', '3_AIT_002_PV', '3_AIT_003_PV', '3_AIT_004_PV', '3_AIT_005_PV'
-        ],
-        'quality_water': [  # Edge 2: Quality/Water pressure related
-            '1_LT_001_PV', '2_LT_001_PV', '2_LT_002_PV', '3_LT_001_PV',
-            '1_LS_001_AL', '1_LS_002_AL', '3_LS_001_AL',
-            'LEAK_DIFF_PRESSURE', 'TOTAL_CONS_REQUIRED_FLOW'
-        ]
-    }
-
-def distribute_data_by_attack_type(features: np.ndarray, labels: np.ndarray, 
-                                 feature_cols: List[str], normal_ratio: float = 0.7) -> Dict[int, Dict]:
-    """Distribute data across 3 edges by attack type"""
-    
-    attack_mapping = create_attack_type_mapping()
-    
-    # Find sensor indices for each attack type
-    edge_sensor_indices = {}
-    for edge_id, (attack_type, sensor_names) in enumerate(attack_mapping.items()):
-        indices = []
-        for sensor in sensor_names:
-            if sensor in feature_cols:
-                indices.append(feature_cols.index(sensor))
-        edge_sensor_indices[edge_id] = indices
-    
-    # Separate normal/attack data
-    normal_mask = (labels == 0)
-    attack_mask = (labels == 1)
-    
-    normal_features = features[normal_mask]
-    attack_features = features[attack_mask]
-    
-    edge_data = {}
-    
-    for edge_id in range(3):
-        # Distribute normal data equally across all edges
-        normal_per_edge = len(normal_features) // 3
-        start_idx = edge_id * normal_per_edge
-        end_idx = (edge_id + 1) * normal_per_edge if edge_id < 2 else len(normal_features)
-        
-        edge_normal_features = normal_features[start_idx:end_idx]
-        edge_normal_labels = np.zeros(len(edge_normal_features))
-        
-        # Filter attack data by sensor variance for this edge
-        sensor_indices = edge_sensor_indices[edge_id]
-        if len(sensor_indices) > 0:
-            # Select attack samples with high variance in relevant sensors
-            sensor_variance = np.var(attack_features[:, sensor_indices], axis=1)
-            top_attack_indices = np.argsort(sensor_variance)[-len(attack_features)//3:]
-            edge_attack_features = attack_features[top_attack_indices]
-            edge_attack_labels = np.ones(len(edge_attack_features))
-        else:
-            # Equal distribution if no sensor mapping
-            attack_per_edge = len(attack_features) // 3
-            start_idx = edge_id * attack_per_edge
-            end_idx = (edge_id + 1) * attack_per_edge if edge_id < 2 else len(attack_features)
-            edge_attack_features = attack_features[start_idx:end_idx]
-            edge_attack_labels = np.ones(len(edge_attack_features))
-        
-        # Combine edge data
-        edge_features = np.vstack([edge_normal_features, edge_attack_features])
-        edge_labels = np.concatenate([edge_normal_labels, edge_attack_labels])
-        
-        # Shuffle
-        indices = np.random.permutation(len(edge_features))
-        edge_features = edge_features[indices]
-        edge_labels = edge_labels[indices]
-        
-        edge_data[edge_id] = {
-            'features': edge_features,
-            'labels': edge_labels,
-            'sensor_indices': sensor_indices,
-            'attack_type': list(attack_mapping.keys())[edge_id]
+class WADIDataLoader:
+    def __init__(self, data_path: str = "WADI_FINAL_DATASET.csv"):
+        self.data_path = data_path
+        self.scaler = StandardScaler()
+        self.feature_columns = None
+        self.attack_types = {
+            'flow_pressure': ['1_AIT_001_PV', '1_AIT_002_PV', '1_AIT_003_PV', '1_AIT_004_PV', 
+                             '1_AIT_005_PV', '1_FIT_001_PV', '1_LT_001_PV'],
+            'sensor_hidden': ['2_DPIT_001_PV', '2_FIC_101_PV', '2_FIC_201_PV', '2_FIC_301_PV',
+                            '2_FIC_401_PV', '2_FIC_501_PV', '2_FIC_601_PV', '2_FIT_001_PV'],
+            'quality_pressure': ['2A_AIT_001_PV', '2A_AIT_002_PV', '2A_AIT_003_PV', '2A_AIT_004_PV',
+                               '2B_AIT_001_PV', '2B_AIT_002_PV', '2B_AIT_003_PV', '2B_AIT_004_PV']
         }
-    
-    return edge_data
-
-def preprocess_for_models(features: np.ndarray, model_type: str = 'duogat') -> np.ndarray:
-    """Model-specific preprocessing"""
-    
-    # Standardization
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features)
-    
-    if model_type == 'duogat':
-        # DuoGAT uses difference features as well
-        diff_features = np.diff(features_scaled, axis=0, prepend=features_scaled[0:1])
-        return features_scaled, diff_features
-    elif model_type == 'anomaly_transformer':
-        # Anomaly Transformer uses normalized features only
-        return features_scaled
-    else:
-        return features_scaled
-
-def create_federated_dataloaders(edge_data: Dict[int, Dict], model_type: str = 'duogat', 
-                               window_size: int = 100, batch_size: int = 32, 
-                               test_split: float = 0.2) -> Dict[int, Dict]:
-    """Create federated learning DataLoaders"""
-    
-    federated_loaders = {}
-    
-    for edge_id, data in edge_data.items():
-        features = data['features']
-        labels = data['labels']
         
-        # Model-specific preprocessing
-        if model_type == 'duogat':
-            features_processed, diff_features = preprocess_for_models(features, model_type)
-            # Combine original and difference for DuoGAT
-            features_combined = np.concatenate([features_processed, diff_features], axis=1)
-        else:
-            features_combined = preprocess_for_models(features, model_type)
+    def load_and_preprocess(self) -> pd.DataFrame:
+        """Load and preprocess WADI dataset"""
+        logger.info(f"Loading WADI dataset from {self.data_path}")
         
-        # Train/Test split
+        df = pd.read_csv(self.data_path)
+        logger.info(f"Dataset shape: {df.shape}")
+        
+        # Remove datetime columns
+        df = df.drop(['Date', 'Time'], axis=1)
+        
+        # Get feature columns (all except Label)
+        self.feature_columns = [col for col in df.columns if col != 'Label']
+        logger.info(f"Number of features: {len(self.feature_columns)}")
+        
+        # Handle missing values
+        df = df.fillna(df.median())
+        
+        # Separate features and labels
+        X = df[self.feature_columns].values
+        y = df['Label'].values
+        
+        # Convert to binary classification (0=normal, 1=attack)
+        y = (y > 0).astype(int)
+        
+        # Normalize features
+        X_scaled = self.scaler.fit_transform(X)
+        
+        logger.info(f"Normal samples: {np.sum(y == 0)}, Anomaly samples: {np.sum(y == 1)}")
+        
+        return X_scaled, y
+    
+    def create_federated_split(self, X, y, test_size=0.2, val_size=0.1) -> Dict:
+        """Create federated data split based on attack types"""
+        logger.info("Creating federated data split...")
+        
+        # First split: train/test
         X_train, X_test, y_train, y_test = train_test_split(
-            features_combined, labels, test_size=test_split, 
-            stratify=labels, random_state=42
+            X, y, test_size=test_size, stratify=y, random_state=42
         )
         
-        # Create datasets
-        train_dataset = WADIDataset(X_train, y_train, window_size)
-        test_dataset = WADIDataset(X_test, y_test, window_size)
+        # Second split: train/val
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_train, y_train, test_size=val_size, stratify=y_train, random_state=42
+        )
         
-        # Create DataLoaders
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        # Get normal data for pretraining (first 14 days worth)
+        normal_indices = np.where(y_train == 0)[0]
+        pretrain_size = min(len(normal_indices), 20160)  # 14 days * 24 hours * 60 minutes
+        X_pretrain = X_train[normal_indices[:pretrain_size]]
+        y_pretrain = y_train[normal_indices[:pretrain_size]]
         
-        federated_loaders[edge_id] = {
-            'train_loader': train_loader,
-            'test_loader': test_loader,
-            'feature_dim': features_combined.shape[1],
-            'attack_type': data['attack_type'],
-            'sensor_indices': data['sensor_indices'],
-            'data_size': len(X_train)
+        # Create federated splits
+        edges_data = self._create_edge_splits(X_train, y_train)
+        
+        return {
+            'pretrain': {'X': X_pretrain, 'y': y_pretrain},
+            'edges': edges_data,
+            'val': {'X': X_val, 'y': y_val},
+            'test': {'X': X_test, 'y': y_test}
         }
     
-    return federated_loaders
+    def _create_edge_splits(self, X, y) -> Dict:
+        """Create edge-specific data splits"""
+        edges_data = {}
+        
+        # Get indices for normal and attack samples
+        normal_indices = np.where(y == 0)[0]
+        attack_indices = np.where(y == 1)[0]
+        
+        # Split normal data equally among edges
+        normal_per_edge = len(normal_indices) // 3
+        
+        # For attack data, we'll simulate different attack patterns per edge
+        # In real scenario, this would be based on actual attack types
+        attack_per_edge = len(attack_indices) // 3
+        
+        for edge_id in range(3):
+            # Normal data split
+            start_normal = edge_id * normal_per_edge
+            end_normal = (edge_id + 1) * normal_per_edge if edge_id < 2 else len(normal_indices)
+            edge_normal_indices = normal_indices[start_normal:end_normal]
+            
+            # Attack data split
+            start_attack = edge_id * attack_per_edge
+            end_attack = (edge_id + 1) * attack_per_edge if edge_id < 2 else len(attack_indices)
+            edge_attack_indices = attack_indices[start_attack:end_attack]
+            
+            # Combine indices
+            edge_indices = np.concatenate([edge_normal_indices, edge_attack_indices])
+            np.random.shuffle(edge_indices)
+            
+            edges_data[f'edge_{edge_id}'] = {
+                'X': X[edge_indices],
+                'y': y[edge_indices],
+                'attack_type': list(self.attack_types.keys())[edge_id]
+            }
+            
+            logger.info(f"Edge {edge_id}: {len(edge_indices)} samples "
+                       f"(Normal: {len(edge_normal_indices)}, Attack: {len(edge_attack_indices)})")
+        
+        return edges_data
+    
+    def create_dataloaders(self, data_dict: Dict, batch_size=32, sequence_length=60) -> Dict:
+        """Create PyTorch DataLoaders for all splits"""
+        dataloaders = {}
+        
+        for split_name, data in data_dict.items():
+            if split_name == 'edges':
+                dataloaders[split_name] = {}
+                for edge_name, edge_data in data.items():
+                    dataset = WADIDataset(edge_data['X'], edge_data['y'], sequence_length)
+                    dataloaders[split_name][edge_name] = DataLoader(
+                        dataset, batch_size=batch_size, shuffle=True
+                    )
+            else:
+                dataset = WADIDataset(data['X'], data['y'], sequence_length)
+                dataloaders[split_name] = DataLoader(
+                    dataset, batch_size=batch_size, shuffle=False
+                )
+        
+        return dataloaders
+    
+    def get_data_stats(self, data_dict: Dict) -> Dict:
+        """Get statistics about the data splits"""
+        stats = {}
+        
+        for split_name, data in data_dict.items():
+            if split_name == 'edges':
+                stats[split_name] = {}
+                for edge_name, edge_data in data.items():
+                    X, y = edge_data['X'], edge_data['y']
+                    stats[split_name][edge_name] = {
+                        'total_samples': len(X),
+                        'normal_samples': np.sum(y == 0),
+                        'attack_samples': np.sum(y == 1),
+                        'attack_ratio': np.sum(y == 1) / len(y),
+                        'attack_type': edge_data['attack_type']
+                    }
+            else:
+                X, y = data['X'], data['y']
+                stats[split_name] = {
+                    'total_samples': len(X),
+                    'normal_samples': np.sum(y == 0),
+                    'attack_samples': np.sum(y == 1),
+                    'attack_ratio': np.sum(y == 1) / len(y)
+                }
+        
+        return stats
 
-def prepare_federated_data(csv_path: str = 'WADI_FINAL_DATASET.csv', 
-                         model_type: str = 'duogat',
-                         window_size: int = 100, 
-                         batch_size: int = 32) -> Dict[int, Dict]:
-    """Complete federated data preparation pipeline"""
+def calculate_wasserstein_distance(data1: np.ndarray, data2: np.ndarray) -> float:
+    """Calculate Wasserstein distance between two data distributions"""
+    from scipy.stats import wasserstein_distance
     
-    print("Loading WADI dataset...")
-    features, labels, feature_cols = load_wadi_dataset(csv_path)
+    # Flatten data if needed
+    if data1.ndim > 1:
+        data1 = data1.flatten()
+    if data2.ndim > 1:
+        data2 = data2.flatten()
     
-    print(f"Dataset shape: {features.shape}")
-    print(f"Normal samples: {np.sum(labels == 0)}, Attack samples: {np.sum(labels == 1)}")
+    return wasserstein_distance(data1, data2)
+
+def simulate_distribution_shift(X: np.ndarray, shift_type: str = 'scale', 
+                              intensity: float = 2.0) -> np.ndarray:
+    """Simulate distribution shift in data"""
+    X_shifted = X.copy()
     
-    print("Distributing data across edges...")
-    edge_data = distribute_data_by_attack_type(features, labels, feature_cols)
+    if shift_type == 'scale':
+        X_shifted = X_shifted * intensity
+    elif shift_type == 'offset':
+        X_shifted = X_shifted + intensity
+    elif shift_type == 'noise':
+        noise = np.random.normal(0, intensity * np.std(X), X.shape)
+        X_shifted = X_shifted + noise
     
-    print("Creating federated dataloaders...")
-    federated_loaders = create_federated_dataloaders(
-        edge_data, model_type, window_size, batch_size
-    )
-    
-    # Print data distribution
-    for edge_id, loader_info in federated_loaders.items():
-        print(f"Edge {edge_id} ({loader_info['attack_type']}): "
-              f"{loader_info['data_size']} samples, "
-              f"feature_dim: {loader_info['feature_dim']}")
-    
-    return federated_loaders
+    return X_shifted
 
 if __name__ == "__main__":
-    # Test execution
-    federated_data = prepare_federated_data(
-        csv_path='WADI_FINAL_DATASET.csv',
-        model_type='duogat',
-        window_size=100,
-        batch_size=32
-    )
+    # Test the data loader
+    loader = WADIDataLoader()
+    X, y = loader.load_and_preprocess()
+    data_splits = loader.create_federated_split(X, y)
+    stats = loader.get_data_stats(data_splits)
     
-    print("\nFederated data preparation completed!")
+    print("Data Statistics:")
+    for split_name, split_stats in stats.items():
+        print(f"\n{split_name.upper()}:")
+        if isinstance(split_stats, dict) and 'edges' not in split_name:
+            for key, value in split_stats.items():
+                print(f"  {key}: {value}")
+        elif split_name == 'edges':
+            for edge_name, edge_stats in split_stats.items():
+                print(f"  {edge_name}:")
+                for key, value in edge_stats.items():
+                    print(f"    {key}: {value}")
